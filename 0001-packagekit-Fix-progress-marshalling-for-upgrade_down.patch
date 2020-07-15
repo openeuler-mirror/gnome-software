@@ -1,0 +1,123 @@
+From ece9a68becd6441d238f23acd2a1b156243fa7b6 Mon Sep 17 00:00:00 2001
+From: Kalev Lember <klember@redhat.com>
+Date: Tue, 7 May 2019 08:22:53 +0200
+Subject: [PATCH] packagekit: Fix progress marshalling for upgrade_download and
+ refresh
+
+The new GsPackageKitHelper class introduced in mega-commit 37103e6 only
+handled progress marshalling when downloading a list of packages, but
+not when the PK transaction is one big monolithic operation that only
+has a single GsApp associated, such as when downloading all of the
+distro upgrades, or when refreshing the cache.
+
+This commit adds a way to explicitly add a GsApp to GsPackageKitHelper
+to use for marshalling progress in these cases.
+---
+ plugins/packagekit/gs-packagekit-helper.c         | 13 ++++++++++++-
+ plugins/packagekit/gs-packagekit-helper.h         |  3 +++
+ plugins/packagekit/gs-plugin-packagekit-refresh.c |  2 +-
+ plugins/packagekit/gs-plugin-packagekit-upgrade.c |  2 +-
+ 4 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/plugins/packagekit/gs-packagekit-helper.c b/plugins/packagekit/gs-packagekit-helper.c
+index a292e0068..39c026c3e 100644
+--- a/plugins/packagekit/gs-packagekit-helper.c
++++ b/plugins/packagekit/gs-packagekit-helper.c
+@@ -1,6 +1,7 @@
+ /* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
+  *
+  * Copyright (C) 2016-2018 Richard Hughes <richard@hughsie.com>
++ * Copyright (C) 2019 Kalev Lember <klember@redhat.com>
+  *
+  * Licensed under the GNU General Public License Version 2
+  *
+@@ -29,6 +30,7 @@
+ struct _GsPackagekitHelper {
+ 	GObject			 parent_instance;
+ 	GHashTable		*apps;
++	GsApp			*progress_app;
+ 	GsPlugin		*plugin;
+ };
+ 
+@@ -43,7 +45,9 @@ gs_packagekit_helper_cb (PkProgress *progress, PkProgressType type, gpointer use
+ 	GsApp *app = NULL;
+ 
+ 	/* optional */
+-	if (package_id != NULL)
++	if (self->progress_app != NULL)
++		app = self->progress_app;
++	else if (package_id != NULL)
+ 		app = gs_packagekit_helper_get_app_by_id (self, package_id);
+ 
+ 	if (type == PK_PROGRESS_TYPE_STATUS) {
+@@ -79,6 +83,12 @@ gs_packagekit_helper_add_app (GsPackagekitHelper *self, GsApp *app)
+ 	}
+ }
+ 
++void
++gs_packagekit_helper_set_progress_app (GsPackagekitHelper *self, GsApp *progress_app)
++{
++	g_set_object (&self->progress_app, progress_app);
++}
++
+ GsPlugin *
+ gs_packagekit_helper_get_plugin (GsPackagekitHelper *self)
+ {
+@@ -104,6 +114,7 @@ gs_packagekit_helper_finalize (GObject *object)
+ 	self = GS_PACKAGEKIT_HELPER (object);
+ 
+ 	g_object_unref (self->plugin);
++	g_clear_object (&self->progress_app);
+ 	g_hash_table_unref (self->apps);
+ 
+ 	G_OBJECT_CLASS (gs_packagekit_helper_parent_class)->finalize (object);
+diff --git a/plugins/packagekit/gs-packagekit-helper.h b/plugins/packagekit/gs-packagekit-helper.h
+index 3b5263c0a..b18b8229b 100644
+--- a/plugins/packagekit/gs-packagekit-helper.h
++++ b/plugins/packagekit/gs-packagekit-helper.h
+@@ -1,6 +1,7 @@
+ /* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*-
+  *
+  * Copyright (C) 2016-2018 Richard Hughes <richard@hughsie.com>
++ * Copyright (C) 2019 Kalev Lember <klember@redhat.com>
+  *
+  * Licensed under the GNU General Public License Version 2
+  *
+@@ -36,6 +37,8 @@ GsPackagekitHelper *gs_packagekit_helper_new		(GsPlugin		*plugin);
+ GsPlugin	*gs_packagekit_helper_get_plugin	(GsPackagekitHelper	*self);
+ void		 gs_packagekit_helper_add_app		(GsPackagekitHelper	*self,
+ 							 GsApp			*app);
++void		 gs_packagekit_helper_set_progress_app	(GsPackagekitHelper	*self,
++							 GsApp			*progress_app);
+ GsApp		*gs_packagekit_helper_get_app_by_id	(GsPackagekitHelper	*progress,
+ 							 const gchar		*package_id);
+ void		 gs_packagekit_helper_cb		(PkProgress		*progress,
+diff --git a/plugins/packagekit/gs-plugin-packagekit-refresh.c b/plugins/packagekit/gs-plugin-packagekit-refresh.c
+index ff893daaf..a8093de2c 100644
+--- a/plugins/packagekit/gs-plugin-packagekit-refresh.c
++++ b/plugins/packagekit/gs-plugin-packagekit-refresh.c
+@@ -156,7 +156,7 @@ gs_plugin_refresh (GsPlugin *plugin,
+ 
+ 	/* refresh the metadata */
+ 	gs_plugin_status_update (plugin, NULL, GS_PLUGIN_STATUS_WAITING);
+-	gs_packagekit_helper_add_app (helper, app_dl);
++	gs_packagekit_helper_set_progress_app (helper, app_dl);
+ 	results = pk_client_refresh_cache (PK_CLIENT (priv->task),
+ 	                                   FALSE /* force */,
+ 	                                   cancellable,
+diff --git a/plugins/packagekit/gs-plugin-packagekit-upgrade.c b/plugins/packagekit/gs-plugin-packagekit-upgrade.c
+index 63175bec3..38de93d55 100644
+--- a/plugins/packagekit/gs-plugin-packagekit-upgrade.c
++++ b/plugins/packagekit/gs-plugin-packagekit-upgrade.c
+@@ -77,7 +77,7 @@ gs_plugin_app_upgrade_download (GsPlugin *plugin,
+ 
+ 	/* ask PK to download enough packages to upgrade the system */
+ 	gs_app_set_state (app, AS_APP_STATE_INSTALLING);
+-	gs_packagekit_helper_add_app (helper, app);
++	gs_packagekit_helper_set_progress_app (helper, app);
+ 	results = pk_task_upgrade_system_sync (priv->task,
+ 					       gs_app_get_version (app),
+ 					       PK_UPGRADE_KIND_ENUM_COMPLETE,
+-- 
+2.21.0
+
