@@ -1,6 +1,6 @@
 Name:                gnome-software
 Version:             3.30.6
-Release:             6
+Release:             7
 Summary:             GNOME software Store
 License:             GPLv2+
 URL:                 https://wiki.gnome.org/Apps/Software
@@ -15,6 +15,7 @@ BuildRequires:       libappstream-glib-devel >= 0.7.14-3 libsoup-devel meson
 BuildRequires:       PackageKit-glib-devel >= 1.1.1 polkit-devel libsecret-devel
 BuildRequires:       flatpak-devel >= 0.9.4 ostree-devel rpm-ostree-devel
 BuildRequires:       libgudev1-devel valgrind-devel liboauth-devel snapd-glib-devel >= 1.42
+BuildRequires:       gcc gcc-c++
 Requires:            appstream-data epiphany-runtime
 Requires:            flatpak >= 0.9.4 flatpak-libs >= 0.9.4 fwupd >= 1.0.7 glib2 >= 2.56.0
 Requires:            gnome-desktop3 >= 3.18.0 gnome-menus gsettings-desktop-schemas >= 3.12.0
@@ -100,5 +101,8 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/*.desktop
 %{_datadir}/applications/org.gnome.Software.Editor.desktop
 
 %changelog
+* Tue May 18 2021 lin.zhang <lin.zhang@turbolinux.com.cn> - 3.30.6-7
+- add BuildRequires gcc gcc-c++
+
 * Fri Apr 24 2020 wangyue<wangyue92@huawei.com> - 3.30.6-6
 - package init
