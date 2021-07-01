@@ -1,0 +1,271 @@
+From b3a50ee2d6b93980d1808599ba003e9afc4feae5 Mon Sep 17 00:00:00 2001
+From: Kalev Lember <klember@redhat.com>
+Date: Mon, 14 Sep 2020 12:07:30 +0200
+Subject: [PATCH] Revert "packagekit: Avoid 600000 allocations when comparing
+ package IDs"
+
+This broke packagekit updates.
+
+https://gitlab.gnome.org/GNOME/gnome-software/-/issues/1061
+https://bodhi.fedoraproject.org/updates/FEDORA-2020-7f57486c95#comment-1621958
+
+This reverts commit 955570e4a5d737a9a4f85860fd7e483158e130c4.
+---
+ .../packagekit/gs-plugin-packagekit-refine.c  |  12 +-
+ .../gs-plugin-packagekit-url-to-app.c         |   6 +-
+ plugins/packagekit/packagekit-common.c        | 149 ++++++------------
+ plugins/packagekit/packagekit-common.h        |   3 +-
+ 4 files changed, 54 insertions(+), 116 deletions(-)
+
+diff --git a/plugins/packagekit/gs-plugin-packagekit-refine.c b/plugins/packagekit/gs-plugin-packagekit-refine.c
+index 68f7eb6..97c70dd 100644
+--- a/plugins/packagekit/gs-plugin-packagekit-refine.c
++++ b/plugins/packagekit/gs-plugin-packagekit-refine.c
+@@ -345,7 +345,6 @@ gs_plugin_packagekit_refine_details2 (GsPlugin *plugin,
+ 	g_autoptr(GPtrArray) array = NULL;
+ 	g_autoptr(GPtrArray) package_ids = NULL;
+ 	g_autoptr(PkResults) results = NULL;
+-	g_autoptr(GHashTable) details_collection = NULL;
+ 
+ 	package_ids = g_ptr_array_new_with_free_func (g_free);
+ 	for (i = 0; i < gs_app_list_length (list); i++) {
+@@ -375,17 +374,11 @@ gs_plugin_packagekit_refine_details2 (GsPlugin *plugin,
+ 		return FALSE;
+ 	}
+ 
+-	/* get the results and copy them into a hash table for fast lookups:
+-	 * there are typically 400 to 700 elements in @array, and 100 to 200
+-	 * elements in @list, each with 1 or 2 source IDs to look up (but
+-	 * sometimes 200) */
+-	array = pk_results_get_details_array (results);
+-	details_collection = gs_plugin_packagekit_details_array_to_hash (array);
+-
+ 	/* set the update details for the update */
++	array = pk_results_get_details_array (results);
+ 	for (i = 0; i < gs_app_list_length (list); i++) {
+ 		app = gs_app_list_index (list, i);
+-		gs_plugin_packagekit_refine_details_app (plugin, details_collection, app);
++		gs_plugin_packagekit_refine_details_app (plugin, array, app);
+ 	}
+ 
+ 	return TRUE;
+diff --git a/plugins/packagekit/gs-plugin-packagekit-url-to-app.c b/plugins/packagekit/gs-plugin-packagekit-url-to-app.c
+index 0418920..7f566c7 100644
+--- a/plugins/packagekit/gs-plugin-packagekit-url-to-app.c
++++ b/plugins/packagekit/gs-plugin-packagekit-url-to-app.c
+@@ -106,15 +106,11 @@ gs_plugin_url_to_app (GsPlugin *plugin,
+ 	details = pk_results_get_details_array (results);
+ 
+ 	if (packages->len >= 1) {
+-		g_autoptr(GHashTable) details_collection = NULL;
+-
+ 		if (gs_app_get_local_file (app) != NULL)
+ 			return TRUE;
+ 
+-		details_collection = gs_plugin_packagekit_details_array_to_hash (details);
+-
+ 		gs_plugin_packagekit_resolve_packages_app (plugin, packages, app);
+-		gs_plugin_packagekit_refine_details_app (plugin, details_collection, app);
++		gs_plugin_packagekit_refine_details_app (plugin, details, app);
+ 
+ 		gs_app_list_add (list, app);
+ 	} else {
+diff --git a/plugins/packagekit/packagekit-common.c b/plugins/packagekit/packagekit-common.c
+index ed77b34..6914dde 100644
+--- a/plugins/packagekit/packagekit-common.c
++++ b/plugins/packagekit/packagekit-common.c
+@@ -388,127 +388,78 @@ gs_plugin_packagekit_set_metadata_from_package (GsPlugin *plugin,
+ 			    pk_package_get_summary (package));
+ }
+ 
+-/* Hash functions which compare PkPackageIds on NAME, VERSION and ARCH, but not DATA.
+- * This is because some backends do not append the origin.
++/*
++ * gs_pk_compare_ids:
+  *
+- * Borrowing some implementation details from pk-package-id.c, a package
+- * ID is a semicolon-separated list of NAME;[VERSION];[ARCH];[DATA],
+- * so a comparison which ignores DATA is just a strncmp() up to and
+- * including the final semicolon.
+- *
+- * Doing it this way means zero allocations, which allows the hash and
+- * equality functions to be fast. This is important when dealing with
+- * large refine() package lists.
+- *
+- * The hash and equality functions assume that the IDs they are passed are
+- * valid. */
+-static guint
+-package_id_hash (gconstpointer key)
+-{
+-	const gchar *package_id = key;
+-	gchar *no_data;
+-	gsize i, last_semicolon = 0;
+-
+-	/* find the last semicolon, which starts the DATA section */
+-	for (i = 0; package_id[i] != '\0'; i++) {
+-		if (package_id[i] == ';')
+-			last_semicolon = i;
+-	}
+-
+-	/* exit early if the DATA section was empty */
+-	if (last_semicolon + 1 == i)
+-		return g_str_hash (package_id);
+-
+-	/* extract up to (and including) the last semicolon into a local string */
+-	no_data = g_alloca (last_semicolon + 2);
+-	memcpy (no_data, package_id, last_semicolon + 1);
+-	no_data[last_semicolon + 1] = '\0';
+-
+-	return g_str_hash (no_data);
+-}
+-
++ * Do not compare the repo. Some backends do not append the origin.
++ */
+ static gboolean
+-package_id_equal (gconstpointer a,
+-                  gconstpointer b)
++gs_pk_compare_ids (const gchar *package_id1, const gchar *package_id2)
+ {
+-	const gchar *package_id_a = a;
+-	const gchar *package_id_b = b;
+-	gsize i, n_semicolons = 0;
+-
+-	/* compare up to and including the last semicolon */
+-	for (i = 0; package_id_a[i] != '\0' && package_id_b[i] != '\0'; i++) {
+-		if (package_id_a[i] != package_id_b[i])
+-			return FALSE;
+-		if (package_id_a[i] == ';')
+-			n_semicolons++;
+-		if (n_semicolons == 4)
+-			return TRUE;
+-	}
+-
+-	return package_id_a[i] == package_id_b[i];
+-}
+-
+-GHashTable *
+-gs_plugin_packagekit_details_array_to_hash (GPtrArray *array)
+-{
+-	g_autoptr(GHashTable) details_collection = NULL;
+-
+-	details_collection = g_hash_table_new_full (package_id_hash, package_id_equal,
+-						    NULL, NULL);
+-
+-	for (gsize i = 0; i < array->len; i++) {
+-		PkDetails *details = g_ptr_array_index (array, i);
+-		g_hash_table_insert (details_collection,
+-				     pk_details_get_package_id (details),
+-				     details);
+-	}
+-
+-	return g_steal_pointer (&details_collection);
++	gboolean ret;
++	g_auto(GStrv) split1 = NULL;
++	g_auto(GStrv) split2 = NULL;
++
++        split1 = pk_package_id_split (package_id1);
++        if (split1 == NULL)
++               return FALSE;
++        split2 = pk_package_id_split (package_id2);
++        if (split2 == NULL)
++               return FALSE;
++        ret = (g_strcmp0 (split1[PK_PACKAGE_ID_NAME],
++                          split2[PK_PACKAGE_ID_NAME]) == 0 &&
++               g_strcmp0 (split1[PK_PACKAGE_ID_VERSION],
++                          split2[PK_PACKAGE_ID_VERSION]) == 0 &&
++               g_strcmp0 (split1[PK_PACKAGE_ID_ARCH],
++                          split2[PK_PACKAGE_ID_ARCH]) == 0);
++        return ret;
+ }
+ 
+ void
+ gs_plugin_packagekit_refine_details_app (GsPlugin *plugin,
+-					 GHashTable *details_collection,
++					 GPtrArray *array,
+ 					 GsApp *app)
+ {
+ 	GPtrArray *source_ids;
+ 	PkDetails *details;
+ 	const gchar *package_id;
++	guint i;
+ 	guint j;
+ 	guint64 size = 0;
+ 
+-	/* @source_ids can have as many as 200 elements (google-noto); typically
+-	 * it has 1 or 2
+-	 *
+-	 * @details_collection is typically a large list of apps in the
+-	 * repository, on the order of 400 or 700 apps */
+ 	source_ids = gs_app_get_source_ids (app);
+ 	for (j = 0; j < source_ids->len; j++) {
+ 		package_id = g_ptr_array_index (source_ids, j);
+-		details = g_hash_table_lookup (details_collection, package_id);
+-		if (details == NULL)
+-			continue;
+-
+-		if (gs_app_get_license (app) == NULL) {
+-			g_autofree gchar *license_spdx = NULL;
+-			license_spdx = as_utils_license_to_spdx (pk_details_get_license (details));
+-			if (license_spdx != NULL) {
+-				gs_app_set_license (app,
+-						    GS_APP_QUALITY_LOWEST,
+-						    license_spdx);
++                for (i = 0; i < array->len; i++) {
++                       /* right package? */
++                       details = g_ptr_array_index (array, i);
++                       if (!gs_pk_compare_ids (package_id,
++                                               pk_details_get_package_id (details))) {
++                               continue;
+ 			}
++                       if (gs_app_get_license (app) == NULL) {
++                               g_autofree gchar *license_spdx = NULL;
++                               license_spdx = as_utils_license_to_spdx (pk_details_get_license (details));
++                               if (license_spdx != NULL) {
++                                       gs_app_set_license (app,
++                                                           GS_APP_QUALITY_LOWEST,
++                                                           license_spdx);
++                               }
++                       }
++                       if (gs_app_get_url (app, AS_URL_KIND_HOMEPAGE) == NULL) {
++                               gs_app_set_url (app,
++                                               AS_URL_KIND_HOMEPAGE,
++                                               pk_details_get_url (details));
++                       }
++                       if (gs_app_get_description (app) == NULL) {
++                               gs_app_set_description (app,
++                                                       GS_APP_QUALITY_LOWEST,
++                                                       pk_details_get_description (details));
++                       }
++                       size += pk_details_get_size (details);
++                       break;
++
+ 		}
+-		if (gs_app_get_url (app, AS_URL_KIND_HOMEPAGE) == NULL) {
+-			gs_app_set_url (app,
+-					AS_URL_KIND_HOMEPAGE,
+-					pk_details_get_url (details));
+-		}
+-		if (gs_app_get_description (app) == NULL) {
+-			gs_app_set_description (app,
+-			                        GS_APP_QUALITY_LOWEST,
+-			                        pk_details_get_description (details));
+-		}
+-		size += pk_details_get_size (details);
+ 	}
+ 
+ 	/* the size is the size of all sources */
+diff --git a/plugins/packagekit/packagekit-common.h b/plugins/packagekit/packagekit-common.h
+index 9f52368..0742ea3 100644
+--- a/plugins/packagekit/packagekit-common.h
++++ b/plugins/packagekit/packagekit-common.h
+@@ -30,9 +30,8 @@ void		gs_plugin_packagekit_resolve_packages_app	(GsPlugin *plugin,
+ void		gs_plugin_packagekit_set_metadata_from_package	(GsPlugin *plugin,
+ 								 GsApp *app,
+ 								 PkPackage *package);
+-GHashTable *	gs_plugin_packagekit_details_array_to_hash	(GPtrArray *array);
+ void		gs_plugin_packagekit_refine_details_app		(GsPlugin *plugin,
+-								 GHashTable *details_collection,
++								 GPtrArray *array,
+ 								 GsApp *app);
+ void		gs_plugin_packagekit_set_packaging_format	(GsPlugin *plugin,
+ 								 GsApp *app);
